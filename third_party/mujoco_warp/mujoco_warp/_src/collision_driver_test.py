@@ -1,0 +1,1729 @@
+# Copyright 2025 The Newton Developers
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Tests the collision driver."""
+
+import mujoco
+import numpy as np
+import warp as wp
+from absl.testing import absltest
+from absl.testing import parameterized
+
+import mujoco_warp as mjw
+from mujoco_warp import BroadphaseType
+from mujoco_warp import DisableBit
+from mujoco_warp import GeomType
+from mujoco_warp import test_data
+from mujoco_warp._src import collision_convex
+from mujoco_warp._src import types
+from mujoco_warp._src.collision_core import Geom
+from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
+from mujoco_warp._src.collision_primitive import plane_convex
+from mujoco_warp._src.collision_sdf import MeshData
+from mujoco_warp._src.collision_sdf import OptimizationParams
+from mujoco_warp._src.collision_sdf import VolumeData
+from mujoco_warp._src.collision_sdf import gradient_step
+from mujoco_warp._src.collision_sdf import sample_volume_grad
+from mujoco_warp._src.math import upper_trid_index
+from mujoco_warp._src.types import CollisionType
+from mujoco_warp.test_data.collision_sdf.utils import register_sdf_plugins
+
+_TOLERANCE = 5e-5
+
+
+@wp.kernel
+def plane_convex_test(convex_in: Geom, dist_out: wp.array[wp.vec4]):
+  dist, pos, normal = plane_convex(wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0), convex_in, 0.0)
+  dist_out[0] = dist
+
+
+@wp.kernel
+def volume_gradient_test(volume: VolumeData, result_out: wp.array[wp.vec3]):
+  result_out[0] = sample_volume_grad(wp.vec3(0.0), volume)
+
+
+@wp.kernel
+def volume_gradient_step_test(volume: VolumeData, result_out: wp.array[wp.vec4]):
+  params = OptimizationParams()
+  params.rel_mat = wp.identity(3, dtype=float)
+  mesh = MeshData()
+  dist, point = gradient_step(
+    types.GeomType.SDF, wp.vec3(1e-6, 1e-4, 1e-4), params, -1, -1, 1, True, volume, volume, mesh, mesh
+  )
+  result_out[0] = wp.vec4(point[0], point[1], point[2], dist)
+
+
+def _assert_eq(a, b, name):
+  tol = _TOLERANCE * 10
+  err_msg = f"mismatch: {name}"
+  np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
+
+
+class CollisionTest(parameterized.TestCase):
+  """Tests the collision contact functions."""
+
+  _SDF_SDF = {
+    "_NUT_NUT": """
+<mujoco>
+  <extension>
+    <plugin plugin="mujoco.sdf.nut">
+      <instance name="nut1">
+        <config key="radius" value="0.27"/>
+      </instance>
+      <instance name="nut2">
+        <config key="radius" value="0.27"/>
+      </instance>
+    </plugin>
+  </extension>
+  <compiler autolimits="true"/>
+  <option sdf_iterations="10"/> <!-- Increased for better collision accuracy -->
+  <asset>
+    <mesh name="nut_mesh1">
+      <plugin instance="nut1"/>
+    </mesh>
+    <mesh name="nut_mesh2">
+      <plugin instance="nut2"/>
+    </mesh>
+  </asset>
+  <worldbody>
+    <!-- First nut (floating) -->
+    <body pos="0 0 0.5">
+      <joint type="free"/>
+      <geom type="sdf" name="nut1" mesh="nut_mesh1" rgba="0.83 0.68 0.4 1">
+        <plugin instance="nut1"/>
+      </geom>
+    </body>
+    <!-- Second nut (positioned to intersect) -->
+    <body pos="0 0 0.4">
+      <geom type="sdf" name="nut2" mesh="nut_mesh2" rgba="0.9 0.4 0.2 1">
+        <plugin instance="nut2"/>
+      </geom>
+    </body>
+    <light name="left" pos="-1 0 2" cutoff="80"/>
+    <light name="right" pos="1 0 2" cutoff="80"/>
+  </worldbody>
+</mujoco>
+""",
+    "NUT_BOLT": """<mujoco>
+  <extension>
+    <plugin plugin="mujoco.sdf.nut">
+      <instance name="nut">
+        <config key="radius" value="0.26"/>
+      </instance>
+    </plugin>
+    <plugin plugin="mujoco.sdf.bolt">
+      <instance name="bolt">
+        <config key="radius" value="0.255"/>
+      </instance>
+    </plugin>
+  </extension>
+
+  <compiler autolimits="true"/>
+
+
+  <visual>
+    <map force="0.05"/>
+  </visual>
+
+  <asset>
+    <mesh name="nut">
+      <plugin instance="nut"/>
+    </mesh>
+    <mesh name="bolt">
+      <plugin instance="bolt"/>
+    </mesh>
+  </asset>
+
+  <option sdf_iterations="10" sdf_initpoints="20"/>
+
+  <default>
+    <geom solref="0.01 1" solimp=".95 .99 .0001" friction="0.01"/>
+  </default>
+
+  <statistic meansize=".1"/>
+
+  <worldbody>
+    <body pos="-0.0012496 0.00329058 0.830362" quat="-0.000212626 0.999996 -0.00200453 0.00185878">
+      <joint type="free" damping="30"/>
+      <geom type="sdf" name="nut" mesh="nut" rgba="0.83 0.68 0.4 1">
+        <plugin instance="nut"/>
+      </geom>
+    </body>
+    <body euler="180 0 0">
+      <geom type="sdf" name="bolt" mesh="bolt" rgba="0.7 0.7 0.7 1">
+        <plugin instance="bolt"/>
+      </geom>
+    </body>
+    <light name="left" pos="-1 0 2" cutoff="80"/>
+    <light name="right" pos="1 0 2" cutoff="80"/>
+  </worldbody>
+</mujoco>
+""",
+  }
+  _FIXTURES = {
+    "box_plane": """
+        <mujoco>
+          <worldbody>
+            <geom size="40 40 40" type="plane"/>
+            <body pos="0 0 0.3" euler="45 0 0">
+              <freejoint/>
+              <geom size="0.5 0.5 0.5" type="box"/>
+            </body>
+          </worldbody>
+        </mujoco>
+      """,
+    "box_box_vf": """
+        <mujoco>
+          <worldbody>
+            <body pos="0 -0.2 1.2" euler="44 46 0">
+              <freejoint/>
+              <geom size="0.6 0.4 0.7" type="box"/>
+            </body>
+            <body pos="0 0 0" euler="0 0 0">
+              <geom size="0.5 0.5 0.5" type="box"/>
+            </body>
+          </worldbody>
+        </mujoco>
+      """,
+    "box_box_vf_flat": """
+        <mujoco>
+          <worldbody>
+            <body pos="0 0 0" >
+              <geom size="0.6 0.6 0.5" type="box"/>
+            </body>
+            <body pos="-.28 0.4 1.199" >
+              <freejoint/>
+              <geom size="0.6 0.4 0.7" type="box"/>
+            </body>
+          </worldbody>
+        </mujoco>
+      """,
+    "box_box_ee": """
+        <mujoco>
+          <worldbody>
+            <body pos="0 0 0" euler="0 45 0">
+              <geom size="0.5 0.5 0.5" type="box"/>
+            </body>
+            <body pos="0 0 1.6" euler="44 0 90">
+              <freejoint/>
+              <geom size="0.6 0.4 0.7" type="box"/>
+            </body>
+          </worldbody>
+        </mujoco>
+      """,
+    "box_box_ee_deep": """
+        <mujoco>
+          <worldbody>
+            <body pos="0 0 0" euler="0 74 0">
+              <geom size="0.4 0.45 0.4" type="box"/>
+            </body>
+            <body pos="0 0 1.2" euler="24 0 90">
+              <freejoint/>
+              <geom size="0.6 0.4 0.7" type="box"/>
+            </body>
+          </worldbody>
+        </mujoco>
+      """,
+    "plane_sphere": """
+        <mujoco>
+          <worldbody>
+            <geom size="40 40 40" type="plane"/>
+            <body pos="0 0 0.2" euler="45 0 0">
+              <freejoint/>
+              <geom size="0.5" type="sphere"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "plane_ellipsoid": """
+        <mujoco>
+          <worldbody>
+            <geom type="plane" size="10 10 .001"/>
+            <body pos="0 0 .299">
+              <geom type="ellipsoid" size=".1 .2 .3"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "plane_capsule": """
+        <mujoco>
+          <worldbody>
+            <geom size="40 40 40" type="plane"/>
+            <body pos="0 0 0.0" euler="30 30 0">
+              <freejoint/>
+              <geom size="0.05 0.05" type="capsule"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "convex_convex": """
+        <mujoco>
+          <asset>
+            <mesh name="poly"
+            vertex="0.3 0 0  0 0.5 0  -0.3 0 0  0 -0.5 0  0 -1 1  0 1 1"
+            face="0 1 5  0 5 4  0 4 3  3 4 2  2 4 5  1 2 5  0 2 1  0 3 2"/>
+          </asset>
+          <worldbody>
+            <body pos="0.0 2.0 0.35" euler="0 0 90">
+              <freejoint/>
+              <geom size="0.2 0.2 0.2" type="mesh" mesh="poly"/>
+            </body>
+            <body pos="0.0 2.0 2.281" euler="180 0 0">
+              <freejoint/>
+              <geom size="0.2 0.2 0.2" type="mesh" mesh="poly"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "capsule_capsule": """
+        <mujoco model="two_capsules">
+          <worldbody>
+            <body>
+              <joint type="free"/>
+              <geom fromto="0.62235904  0.58846647 0.651046 1.5330081 0.33564585 0.977849"
+               size="0.05" type="capsule"/>
+            </body>
+            <body>
+              <joint type="free"/>
+              <geom fromto="0.5505271 0.60345304 0.476661 1.3900293 0.30709633 0.932082"
+               size="0.05" type="capsule"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "capsule_capsule_parallel_axes": """
+        <mujoco>
+          <worldbody>
+            <body pos="-0.09 0 0">
+              <joint type="free"/>
+              <geom size="0.1 1" type="capsule"/>
+            </body>
+            <body pos="0.09 0 0">
+              <joint type="free"/>
+              <geom size="0.1 1" type="capsule"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_sphere": """
+        <mujoco>
+          <worldbody>
+            <body>
+              <joint type="free"/>
+              <geom pos="0 0 0" size="0.2" type="sphere"/>
+            </body>
+            <body >
+              <joint type="free"/>
+              <geom pos="0 0.3 0" size="0.11" type="sphere"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_capsule": """
+        <mujoco>
+          <worldbody>
+            <body>
+              <joint type="free"/>
+              <geom pos="0 0 0" size="0.25" type="sphere"/>
+            </body>
+            <body>
+              <joint type="free"/>
+              <geom fromto="0.3 0 0 0.7 0 0" size="0.1" type="capsule"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_cylinder_corner": """
+        <mujoco>
+          <worldbody>
+            <body>
+              <joint type="slide" axis="1 0 0"/>
+              <joint type="slide" axis="0 1 0"/>
+              <joint type="slide" axis="0 0 1"/>
+              <geom size="0.1" type="sphere" pos=".33 0 0"/>
+            </body>
+            <body>
+              <geom size="0.15 0.2" type="cylinder" euler="30 45 0"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_cylinder_cap": """
+        <mujoco>
+          <worldbody>
+            <body>
+              <joint type="slide" axis="1 0 0"/>
+              <joint type="slide" axis="0 1 0"/>
+              <joint type="slide" axis="0 0 1"/>
+              <geom size="0.1" type="sphere" pos=".26 -.14 .1"/>
+            </body>
+            <body>
+              <geom size="0.15 0.2" type="cylinder" euler="30 45 0"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_cylinder_side": """
+        <mujoco>
+          <worldbody>
+            <body>
+              <joint type="slide" axis="1 0 0"/>
+              <joint type="slide" axis="0 1 0"/>
+              <joint type="slide" axis="0 0 1"/>
+              <geom size="0.1" type="sphere" pos="0 -.26 0"/>
+            </body>
+            <body>
+              <geom size="0.15 0.2" type="cylinder" euler="30 45 0"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "plane_cylinder_1": """
+        <mujoco>
+          <worldbody>
+            <geom size="40 40 40" type="plane" euler="3 0 0"/>
+            <body pos="0 0 0.1" euler="30 30 0">
+              <freejoint/>
+              <geom size="0.05 0.1" type="cylinder"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "plane_cylinder_2": """
+        <mujoco>
+          <worldbody>
+            <geom size="40 40 40" type="plane" euler="3 0 0"/>
+            <body pos="0.2 0 0.04" euler="90 0 0">
+              <freejoint/>
+              <geom size="0.05 0.1" type="cylinder"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "plane_cylinder_3": """
+        <mujoco>
+          <worldbody>
+            <geom size="40 40 40" type="plane" euler="3 0 0"/>
+            <body pos="0.5 0 0.1" euler="3 0 0">
+              <freejoint/>
+              <geom size="0.05 0.1" type="cylinder"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "mesh_plane_simple": """
+        <mujoco>
+          <asset>
+            <mesh name="cube" vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+          </asset>
+          <worldbody>
+            <geom size="40 40 40" type="plane"/>
+            <body pos="0 0 1" euler="45 0 0">
+              <freejoint/>
+              <geom type="mesh" mesh="cube"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "mesh_plane_complex": """
+        <mujoco>
+          <asset>
+            <mesh name="poly"
+            vertex="
+              0.5 0.0 0.0   0.4 0.3 0.0   0.2 0.45 0.0   0.0 0.5 0.0
+              -0.2 0.45 0.0  -0.4 0.3 0.0  -0.5 0.0 0.0  -0.4 -0.3 0.0
+              -0.2 -0.45 0.0  0.0 -0.5 0.0  0.2 -0.45 0.0  0.4 -0.3 0.0
+              0.0 0.0 1.0
+            "
+            face="
+              0 1 12  1 2 12  2 3 12  3 4 12  4 5 12  5 6 12
+              6 7 12  7 8 12  8 9 12  9 10 12  10 11 12  11 0 12
+              0 1 2  0 2 3  0 3 4  0 4 5  0 5 6  0 6 7  0 7 8  0 8 9  0 9 10  0 10 11  0 11 1
+            "/>
+          </asset>
+          <worldbody>
+            <geom size="40 40 40" type="plane"/>
+            <body pos="0.0 2.0 0.0" euler="90 90 0">
+              <freejoint/>
+              <geom size="0.2 0.2 0.2" type="mesh" mesh="poly"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_box_shallow": """
+        <mujoco>
+          <worldbody>
+            <geom type="box" pos="0 0 0" size=".5 .5 .5" />
+            <body pos="-0.6 -0.6 0.7">
+              <geom type="sphere" size="0.5"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "sphere_box_deep": """
+        <mujoco>
+          <worldbody>
+            <geom type="box" pos="0 0 0" size=".5 .5 .5" />
+            <body pos="-0.6 -0.6 0.7">
+              <geom type="sphere" size="0.5"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "capsule_box_edge": """
+        <mujoco>
+          <worldbody>
+            <geom type="box" pos="0 0 0" size=".5 .4 .9" />
+            <body pos="0.4 0.2 0.8" euler="0 -40 0" >
+              <geom type="capsule" size="0.5 0.8"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "capsule_box_corner": """
+        <mujoco>
+          <worldbody>
+            <geom type="box" pos="0 0 0" size=".5 .55 .6" />
+            <body pos="0.55 0.6 0.65" euler="0 0 0" >
+              <geom type="capsule" size="0.4 0.6"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "capsule_box_face_tip": """
+        <mujoco>
+          <worldbody>
+            <geom type="box" pos="0 0 0" size=".5 .4 .9" />
+            <body pos="0 0 1.5" >
+              <geom type="capsule" size="0.5 0.8"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "capsule_box_face_flat": """
+        <mujoco>
+          <worldbody>
+            <geom type="box" pos="0 0 0" size=".5 .7 .9" />
+            <body pos="0.5 0.2 0.0" euler="0 0 0" >
+              <geom type="capsule" size="0.2 0.4"/>
+              <freejoint/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+  }
+
+  @classmethod
+  def setUpClass(cls):
+    register_sdf_plugins(mjw)
+
+  def test_collision_func_table(self):
+    """Tests that the collision table is in order."""
+    in_order = True
+    prev_idx = -1
+    for pair in MJ_COLLISION_TABLE.keys():
+      idx = upper_trid_index(len(GeomType), pair[0].value, pair[1].value)
+      if pair[1] < pair[0] or idx <= prev_idx:
+        in_order = False
+      prev_idx = idx
+    self.assertTrue(in_order)
+
+  @parameterized.parameters(64, 128)
+  def test_ccd_grid_reuses_launch_module(self, block_dim):
+    """The occupancy query and CCD launch must share one compiled module."""
+    device = wp.get_device()
+    if not device.is_cuda:
+      self.skipTest("CUDA occupancy queries are not used on CPU")
+
+    kernel = collision_convex.ccd_kernel_builder(GeomType.BOX.value, GeomType.BOX.value, 35, 16, True, 0, block_dim, 0)
+    collision_convex._ccd_grid_size(kernel, 1, device)
+    occupancy_module = kernel.module.load(device)
+    launch_module = kernel.module.load(device, block_dim=block_dim)
+    self.assertIs(occupancy_module, launch_module)
+
+  def test_native_ccd_disable_does_not_mutate_global_table(self):
+    initial_type = MJ_COLLISION_TABLE[(GeomType.BOX, GeomType.BOX)]
+    self.assertEqual(initial_type, CollisionType.CONVEX)
+
+    mjm = mujoco.MjModel.from_xml_string("""
+    <mujoco>
+      <option gravity="0 0 -9.81"/>
+      <worldbody>
+        <body name="body1" pos="0 0 0.51">
+          <freejoint/>
+          <geom name="box1" type="box" size="0.5 0.5 0.5"/>
+        </body>
+        <body name="body2" pos="0 0 1.49">
+          <freejoint/>
+          <geom name="box2" type="box" size="0.5 0.5 0.5"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """)
+    mjm.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_NATIVECCD
+
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mujoco.MjData(mjm))
+
+    mjw.collision(m, d)
+
+    self.assertEqual(MJ_COLLISION_TABLE[(GeomType.BOX, GeomType.BOX)], initial_type)
+
+  @parameterized.parameters(_SDF_SDF.keys())
+  def test_sdf_collision(self, fixture):
+    """Tests collisions with different geometries."""
+    mjm, mjd, m, d = test_data.fixture(xml=self._SDF_SDF[fixture])
+
+    mujoco.mj_collision(mjm, mjd)
+    mjw.collision(m, d)
+    for i in range(min(mjd.ncon, d.nacon.numpy()[0])):
+      actual_dist = mjd.contact.dist[i]
+      actual_pos = mjd.contact.pos[i]
+      actual_frame = mjd.contact.frame[i][0:3]
+      result = False
+      test_dist = d.contact.dist.numpy()[i]
+      test_pos = d.contact.pos.numpy()[i, :]
+      test_frame = d.contact.frame.numpy()[i].flatten()[0:3]
+      check_dist = np.allclose(actual_dist, test_dist, rtol=5e-2, atol=1.0e-1)
+      check_frame = np.allclose(actual_frame, test_frame, rtol=5e-2, atol=1.0e-1)
+      check_pos = np.allclose(actual_pos, test_pos, rtol=5e-2, atol=1.0e-1)
+      result = check_dist
+      np.testing.assert_equal(result, True, f"Contact {i} not found in Gjk results")
+
+  @parameterized.parameters(_FIXTURES.keys())
+  def test_collision(self, fixture):
+    """Tests collisions with different geometries."""
+    # TODO(team): warp plane-mesh implementation needs updating to match mujoco
+    if fixture == "mesh_plane_complex":
+      return
+    mjm, mjd, m, d = test_data.fixture(xml=self._FIXTURES[fixture])
+
+    mujoco.mj_collision(mjm, mjd)
+    mjw.collision(m, d)
+
+    self.assertGreater(d.nacon.numpy()[0], 0)
+    self.assertGreater(mjd.ncon, 0)
+
+    for i in range(mjd.ncon):
+      actual_dist = mjd.contact.dist[i]
+      actual_pos = mjd.contact.pos[i]
+      actual_frame = mjd.contact.frame[i]
+      result = False
+      for j in range(d.nacon.numpy()[0]):
+        test_dist = d.contact.dist.numpy()[j]
+        test_pos = d.contact.pos.numpy()[j, :]
+        test_frame = d.contact.frame.numpy()[j].flatten()
+
+        check_dist = np.allclose(actual_dist, test_dist, rtol=5e-2, atol=1.0e-2)
+        check_pos = np.allclose(actual_pos, test_pos, rtol=5e-2, atol=1.0e-2)
+        check_frame = np.allclose(actual_frame, test_frame, rtol=5e-2, atol=1.0e-2)
+        if check_dist and check_pos and check_frame:
+          result = True
+          break
+      np.testing.assert_equal(result, True, f"Contact {i} not found in Gjk results")
+
+    # mujoco and mujoco warp have different heuristics for generating multiple contacts
+    # for plane<>mesh collisions
+    if "mesh_plane" in fixture:
+      self.assertGreaterEqual(d.nacon.numpy()[0], mjd.ncon)
+    else:
+      self.assertEqual(d.nacon.numpy()[0], mjd.ncon)
+
+  def test_mesh_mesh_common_translation(self):
+    """Test collision against translation."""
+    vertices = np.array(
+      [
+        [0.0, 0.0, -0.3],
+        [0.2, 0.0, -0.2],
+        [-0.2, 0.0, -0.2],
+        [-0.1, -0.2, -0.2],
+        [0.0, -0.2, -0.2],
+      ],
+      dtype=np.float32,
+    )
+
+    def scene(y_offset):
+      vertex_list = " ".join(str(value) for value in vertices.reshape(-1))
+      return f"""
+        <mujoco>
+          <option cone="elliptic"/>
+          <asset>
+            <mesh name="a" vertex="{vertex_list}"/>
+            <mesh name="b" vertex="{vertex_list}"/>
+          </asset>
+          <worldbody>
+            <body pos="0 {y_offset} 0.5">
+              <freejoint/>
+              <geom type="mesh" mesh="a" gap="0.01"/>
+            </body>
+            <body pos="0.2 {y_offset} 0.5">
+              <freejoint/>
+              <geom type="mesh" mesh="b" gap="0.01"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+
+    def contact_distances(xml):
+      _, _, m, d = test_data.fixture(xml=xml)
+      mjw.forward(m, d)
+      nacon = int(d.nacon.numpy()[0])
+      return d.contact.dist.numpy()[:nacon]
+
+    dists0 = contact_distances(scene(0.0))
+    dists1 = contact_distances(scene(1.0))
+
+    self.assertGreater(len(dists0), 0)
+    self.assertGreater(len(dists1), 0)
+    np.testing.assert_allclose(dists0, dists1, atol=1e-5)
+    np.testing.assert_array_less(dists1, 0.0)
+
+  _HFIELD_FIXTURES = {
+    "hfield_box": """
+        <mujoco>
+          <asset>
+            <hfield name="terrain" nrow="2" ncol="2" size="1 1 0.1 0.1"
+            elevation="0 0
+                       0 0"/>
+          </asset>
+          <worldbody>
+            <geom type="hfield" hfield="terrain" pos="0 0 0"/>
+            <body pos=".0 .0 .1">
+              <freejoint/>
+              <geom type="box" size=".1 .1 .11"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+    "hfield_mesh": """
+        <mujoco>
+          <asset>
+            <hfield name="terrain" nrow="3" ncol="3" size="1 1 0.1 0.1"/>
+            <mesh name="box"
+              vertex="-1 -1 -1
+                       1 -1 -1
+                       1  1 -1
+                      -1  1 -1
+                      -1 -1  1
+                       1 -1  1
+                       1  1  1
+                      -1  1  1"/>
+          </asset>
+          <worldbody>
+            <geom type="hfield" hfield="terrain" pos="0 0 0"/>
+            <body pos=".0 .0 .15">
+              <freejoint/>
+              <geom type="mesh" mesh="box" size=".1 .1 .1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """,
+  }
+
+  @parameterized.parameters(_HFIELD_FIXTURES.keys())
+  def test_hfield_collision(self, fixture):
+    """Tests hfield collision with different geometries."""
+    mjm, mjd, m, d = test_data.fixture(xml=self._HFIELD_FIXTURES[fixture])
+
+    mujoco.mj_collision(mjm, mjd)
+    mjw.collision(m, d)
+
+    self.assertEqual(mjd.ncon > 0, d.nacon.numpy()[0] > 0, "If MJ collides, MJW should too")
+
+  def test_contact_exclude(self):
+    """Tests contact exclude."""
+    _, _, m, _ = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body name="body1">
+            <freejoint/>
+            <geom type="sphere" size=".1"/>
+          </body>
+          <body name="body2">
+            <freejoint/>
+            <geom type="sphere" size=".1"/>
+          </body>
+          <body name="body3">
+            <freejoint/>
+            <geom type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+        <contact>
+          <exclude body1="body1" body2="body2"/>
+        </contact>
+      </mujoco>
+    """
+    )
+    self.assertEqual(m.nxn_geom_pair.numpy().shape[0], 3)
+    np.testing.assert_equal(m.nxn_pairid.numpy()[:][:, 0], np.array([-2, -1, -1]))
+
+  def test_plane_meshtet(self):
+    # tetrahedron, separated in z by 0.1
+    convex = Geom()
+    convex.pos = wp.vec3(0.0)
+    convex.rot = wp.mat33(np.eye(3))
+    convex.graphadr = -1
+    convex.vertnum = 4
+    convex.vertadr = 0
+    verts = np.array(
+      [
+        [-1, 0, 0.1],
+        [1, 0, 0.1],
+        [0, 1, 0.1],
+        [0, 0.5, 1.1],
+      ]
+    )
+    convex.vert = wp.array(verts, dtype=wp.vec3)
+
+    dist = wp.empty(1, dtype=wp.vec4)
+    wp.launch(plane_convex_test, inputs=[convex], outputs=[dist], dim=1)
+    self.assertTrue((dist.numpy() > 0.05).all())
+
+  @parameterized.parameters(list(BroadphaseType))
+  def test_contact_pair(self, broadphase):
+    """Tests contact pair."""
+    # no pairs
+    _, _, m, _ = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body>
+            <freejoint/>
+            <geom type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+      </mujoco>
+    """,
+      overrides={"opt.broadphase": broadphase},
+    )
+    self.assertTrue((m.nxn_pairid.numpy()[:][:, 0] == -1).all())
+
+    # 1 pair
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <body>
+            <freejoint/>
+            <geom name="geom1" type="sphere" size=".1"/>
+          </body>
+          <body>
+            <freejoint/>
+            <geom name="geom2" type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+        <contact>
+          <pair geom1="geom1" geom2="geom2" margin="-1" gap="3" condim="6" friction="5 4 3 2 1" solref="-.25 -.5" solreffriction="2 4" solimp=".1 .2 .3 .4 .5"/>
+        </contact>
+      </mujoco>
+    """
+    )
+    self.assertTrue((m.nxn_pairid.numpy()[:][:, 0] == 0).all())
+
+    d.nacon.zero_()
+    d.contact.dim.zero_()
+
+    for arr in (
+      d.contact.includemargin,
+      d.contact.friction,
+      d.contact.solref,
+      d.contact.solreffriction,
+      d.contact.solimp,
+    ):
+      arr.fill_(wp.inf)
+
+    mjw.collision(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    self.assertEqual(d.contact.includemargin.numpy()[0], -1)
+    self.assertEqual(d.contact.dim.numpy()[0], 6)
+    np.testing.assert_allclose(d.contact.friction.numpy()[0], np.array([5, 4, 3, 2, 1]))
+    np.testing.assert_allclose(d.contact.solref.numpy()[0], np.array([-0.25, -0.5]))
+    np.testing.assert_allclose(d.contact.solreffriction.numpy()[0], np.array([2.0, 4.0]))
+    np.testing.assert_allclose(d.contact.solimp.numpy()[0], np.array([0.1, 0.2, 0.3, 0.4, 0.5]))
+
+    # 1 pair: override contype and conaffinity
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <body name="body1">
+            <freejoint/>
+            <geom name="geom1" type="sphere" size=".1" contype="0" conaffinity="0"/>
+          </body>
+          <body name="body2">
+            <freejoint/>
+            <geom name="geom2" type="sphere" size=".1" contype="0" conaffinity="0"/>
+          </body>
+        </worldbody>
+        <contact>
+          <pair geom1="geom1" geom2="geom2" margin="-1" gap="3" condim="6" friction="5 4 3 2 1" solref="-.25 -.5" solreffriction="2 4" solimp=".1 .2 .3 .4 .5"/>
+        </contact>
+      </mujoco>
+    """
+    )
+    self.assertTrue((m.nxn_pairid.numpy()[:][:, 0] == 0).all())
+
+    d.nacon.zero_()
+    d.contact.dim.zero_()
+
+    for arr in (
+      d.contact.includemargin,
+      d.contact.friction,
+      d.contact.solref,
+      d.contact.solreffriction,
+      d.contact.solimp,
+    ):
+      arr.fill_(wp.inf)
+
+    mjw.collision(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    self.assertEqual(d.contact.includemargin.numpy()[0], -1)
+    self.assertEqual(d.contact.dim.numpy()[0], 6)
+    np.testing.assert_allclose(d.contact.friction.numpy()[0], np.array([5, 4, 3, 2, 1]))
+    np.testing.assert_allclose(d.contact.solref.numpy()[0], np.array([-0.25, -0.5]))
+    np.testing.assert_allclose(d.contact.solreffriction.numpy()[0], np.array([2.0, 4.0]))
+    np.testing.assert_allclose(d.contact.solimp.numpy()[0], np.array([0.1, 0.2, 0.3, 0.4, 0.5]))
+
+    # 1 pair: override exclude
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <body name="body1">
+            <freejoint/>
+            <geom name="geom1" type="sphere" size=".1"/>
+          </body>
+          <body name="body2">
+            <freejoint/>
+            <geom name="geom2" type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+        <contact>
+          <exclude body1="body1" body2="body2"/>
+          <pair geom1="geom1" geom2="geom2" margin="-1" gap="3" condim="6" friction="5 4 3 2 1" solref="-.25 -.5" solreffriction="2 4" solimp=".1 .2 .3 .4 .5"/>
+        </contact>
+      </mujoco>
+    """
+    )
+    self.assertTrue((m.nxn_pairid.numpy()[:][:, 0] == 0).all())
+
+    d.nacon.zero_()
+    d.contact.dim.zero_()
+
+    for arr in (
+      d.contact.includemargin,
+      d.contact.friction,
+      d.contact.solref,
+      d.contact.solreffriction,
+      d.contact.solimp,
+    ):
+      arr.fill_(wp.inf)
+
+    mjw.collision(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    self.assertEqual(d.contact.includemargin.numpy()[0], -1)
+    self.assertEqual(d.contact.dim.numpy()[0], 6)
+    np.testing.assert_allclose(d.contact.friction.numpy()[0], np.array([5, 4, 3, 2, 1]))
+    np.testing.assert_allclose(d.contact.solref.numpy()[0], np.array([-0.25, -0.5]))
+    np.testing.assert_allclose(d.contact.solreffriction.numpy()[0], np.array([2.0, 4.0]))
+    np.testing.assert_allclose(d.contact.solimp.numpy()[0], np.array([0.1, 0.2, 0.3, 0.4, 0.5]))
+
+    # 1 pair 1 exclude
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <body name="body1">
+            <freejoint/>
+            <geom name="geom1" type="sphere" size=".1"/>
+          </body>
+          <body name="body2">
+            <freejoint/>
+            <geom name="geom2" type="sphere" size=".1"/>
+          </body>
+          <body name="body3">
+            <freejoint/>
+            <geom name="geom3" type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+        <contact>
+          <exclude body1="body1" body2="body2"/>
+          <pair geom1="geom2" geom2="geom3" margin="-1" gap="3" condim="6" friction="5 4 3 2 1" solref="-.25 -.5" solreffriction="2 4" solimp=".1 .2 .3 .4 .5"/>
+        </contact>
+      </mujoco>
+    """
+    )
+    np.testing.assert_equal(m.nxn_pairid.numpy()[:][:, 0], np.array([-2, -1, 0]))
+
+    d.nacon.zero_()
+    d.contact.dim.zero_()
+
+    for arr in (
+      d.contact.includemargin,
+      d.contact.friction,
+      d.contact.solref,
+      d.contact.solreffriction,
+      d.contact.solimp,
+    ):
+      arr.fill_(wp.inf)
+
+    mjw.collision(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], 2)
+    self.assertEqual(d.contact.includemargin.numpy()[1], -1)
+    self.assertEqual(d.contact.dim.numpy()[1], 6)
+    np.testing.assert_allclose(d.contact.friction.numpy()[1], np.array([5, 4, 3, 2, 1]))
+    np.testing.assert_allclose(d.contact.solref.numpy()[1], np.array([-0.25, -0.5]))
+    np.testing.assert_allclose(d.contact.solreffriction.numpy()[1], np.array([2.0, 4.0]))
+    np.testing.assert_allclose(d.contact.solimp.numpy()[1], np.array([0.1, 0.2, 0.3, 0.4, 0.5]))
+
+  @parameterized.product(constraint=(0, DisableBit.CONSTRAINT), contact=(0, DisableBit.CONTACT))
+  def test_collision_disableflags(self, constraint, contact):
+    """Tests collision disableflags."""
+    mjm, mjd, m, d = test_data.fixture(
+      "humanoid/humanoid.xml", keyframe=0, overrides={"opt.disableflags": constraint | contact}
+    )
+
+    mujoco.mj_collision(mjm, mjd)
+    mjw.collision(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], mjd.ncon)
+
+  def test_hfield_maxconpair(self):
+    _XML = """
+    <mujoco>
+      <asset>
+        <hfield name="hfield" nrow="10" ncol="10" size="1e-1 1e-1 1 1"/>
+      </asset>
+      <worldbody>
+        <body>
+          <joint type="slide" axis="0 0 1"/>
+          <geom type="box" size="1 1 .1"/>
+        </body>
+        <geom type="hfield" hfield="hfield"/>
+      </worldbody>
+      <keyframe>
+        <key qpos=".099"/>
+      </keyframe>
+    </mujoco>
+    """
+
+    _, _, m, d = test_data.fixture(xml=_XML, keyframe=0)
+
+    mjw.collision(m, d)
+
+    np.testing.assert_equal(d.nacon.numpy()[0], 4)
+    self.assertTrue(d.overflow.numpy()[0] & types.OverflowType.HFIELD)
+
+  @parameterized.parameters(1, 2)
+  def test_hfield_sparse_subgrid_contacts(self, nworld):
+    """Tests that non-colliding prisms in the subgrid do not starve active contacts."""
+    # The box is rotated 45 deg, so its subgrid is a large square while the box itself only
+    # occupies the diagonal: 1458 prisms, of which more than MJ_MAXCONPAIR are in contact.
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <asset>
+          <hfield name="hfield" nrow="40" ncol="40" size="1 1 .1 .1"/>
+        </asset>
+        <worldbody>
+          <body pos="0 0 .095" euler="0 0 45">
+            <freejoint/>
+            <geom type="box" size=".9 .02 .1"/>
+          </body>
+          <geom type="hfield" hfield="hfield"/>
+        </worldbody>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+
+    if nworld == 2:
+      # Vary world 1 so it does not collide.
+      qpos = d.qpos.numpy()
+      qpos[1, 2] += 1.0
+      d.qpos.assign(qpos)
+      mjw.kinematics(m, d)
+
+    d.nacon.fill_(-1)
+    d.overflow.zero_()
+
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    np.testing.assert_equal(nacon, 4)
+    np.testing.assert_equal(d.contact.worldid.numpy()[:nacon], 0)
+    self.assertTrue(d.overflow.numpy()[0] & types.OverflowType.HFIELD)
+
+    if nworld == 2:
+      self.assertFalse(d.overflow.numpy()[1] & types.OverflowType.HFIELD)
+
+  @parameterized.parameters(1, 2)
+  def test_hfield_sparse_subgrid_no_overflow(self, nworld):
+    """Tests that non-colliding prisms in the subgrid do not report an overflow."""
+    # As above at a coarser resolution: 72 prisms, far fewer than MJ_MAXCONPAIR in contact.
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <asset>
+          <hfield name="hfield" nrow="9" ncol="9" size="1 1 .1 .1"/>
+        </asset>
+        <worldbody>
+          <body pos="0 0 .095" euler="0 0 45">
+            <freejoint/>
+            <geom type="box" size=".9 .02 .1"/>
+          </body>
+          <geom type="hfield" hfield="hfield"/>
+        </worldbody>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+
+    if nworld == 2:
+      # Vary world 1 so it does not collide.
+      qpos = d.qpos.numpy()
+      qpos[1, 2] += 1.0
+      d.qpos.assign(qpos)
+      mjw.kinematics(m, d)
+
+    d.nacon.fill_(-1)
+    d.overflow.zero_()
+
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    np.testing.assert_equal(nacon, 4)
+    np.testing.assert_equal(d.contact.worldid.numpy()[:nacon], 0)
+    self.assertFalse(d.overflow.numpy()[0] & types.OverflowType.HFIELD)
+
+    if nworld == 2:
+      self.assertFalse(d.overflow.numpy()[1] & types.OverflowType.HFIELD)
+
+  def test_min_friction(self):
+    with self.assertWarns(UserWarning):
+      _, _, _, d = test_data.fixture(
+        xml="""
+      <mujoco>
+        <worldbody>
+          <body>
+            <geom type="sphere" size=".1" friction="0 0 0"/>
+            <joint type="slide"/>
+          </body>
+          <body>
+            <geom type="sphere" size=".1" friction="0 0 0"/>
+            <joint type="slide"/>
+          </body>
+        </worldbody>
+        <keyframe>
+          <key qpos="0 .1"/>
+        </keyframe>
+      </mujoco>
+      """,
+        keyframe=0,
+      )
+
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    np.testing.assert_allclose(d.contact.friction.numpy()[0], types.MJ_MINMU)
+
+  @parameterized.parameters(("1", "1"), ("1", "2"), ("2", "1"))
+  def test_contact_parameter_mixing(self, priority1, priority2):
+    _, mjd, m, d = test_data.fixture(
+      xml=f"""
+    <mujoco>
+      <worldbody>
+        <geom type="plane" size="10 10 .001" friction=".01 .02 .03" priority="{priority1}" condim="1" margin=".002"/>
+        <body>
+          <geom type="sphere" size=".1" friction=".123 .456 .789" priority="{priority2}" condim="3" margin=".004"/>
+          <freejoint/>
+        </body>
+      </worldbody>
+      <keyframe>
+        <key qpos="0 0 .075 1 0 0 0"/>
+      </keyframe>
+    </mujoco>
+    """,
+      keyframe=0,
+    )
+
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    _assert_eq(nacon, 1, "nacon")
+    _assert_eq(d.contact.friction.numpy()[0], mjd.contact.friction[0], "friction")
+    _assert_eq(d.contact.solref.numpy()[0], mjd.contact.solref[0], "solref")
+    _assert_eq(d.contact.solimp.numpy()[0], mjd.contact.solimp[0], "solimp")
+    _assert_eq(d.contact.includemargin.numpy()[0], mjd.contact.includemargin[0], "includemargin")
+    _assert_eq(d.contact.dim.numpy()[0], mjd.contact.dim[0], "dim")
+
+  def test_box_box_face_penetration_depth(self):
+    """Tests box-box face-to-face penetration depth calculation.
+
+    This test validates the bugfix for box-box collision depth calculation.
+    Two aligned boxes with face-to-face contact should report correct penetration depth.
+
+    Note: MuJoCo's native collision detection has a bug in box-box face-to-face
+    penetration depth calculation (it reports half the correct depth). This test
+    verifies that mujoco_warp reports the analytically correct depth.
+    """
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+    <mujoco>
+      <worldbody>
+        <body pos="0 0 0">
+          <geom type="box" size="0.5 0.5 0.5"/>
+        </body>
+        <body pos="0 0 0.8">
+          <freejoint/>
+          <geom type="box" size="0.5 0.5 0.5"/>
+        </body>
+      </worldbody>
+      <keyframe>
+        <key qpos="0 0 0.8 1 0 0 0"/>
+      </keyframe>
+    </mujoco>
+    """,
+      keyframe=0,
+    )
+
+    mujoco.mj_collision(mjm, mjd)
+    mjw.collision(m, d)
+
+    # Both boxes have size 0.5, so faces are at z=0.5 and z=0.3 (0.8-0.5)
+    # Penetration depth should be 0.5 - 0.3 = 0.2
+    expected_penetration = -0.2
+
+    self.assertGreater(d.nacon.numpy()[0], 0, "Should have contacts")
+    self.assertGreater(mjd.ncon, 0, "MuJoCo should have contacts")
+
+    # Verify that mujoco_warp reports the analytically correct penetration depth
+    # Note: We do NOT compare against MuJoCo's output here because MuJoCo has a bug
+    # that causes it to report half the correct penetration depth for face-to-face contacts
+    for i in range(d.nacon.numpy()[0]):
+      mjw_dist = d.contact.dist.numpy()[i]
+      self.assertAlmostEqual(
+        mjw_dist,
+        expected_penetration,
+        places=2,
+        msg=f"Contact {i}: Expected penetration {expected_penetration:.4f}, got {mjw_dist:.4f}",
+      )
+
+  _SDF_VOLUME = {
+    "sdf_plane": """
+        <mujoco>
+          <option sdf_iterations="10" sdf_initpoints="40"/>
+          <asset>
+            <mesh name="cube"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+          </asset>
+          <worldbody>
+            <geom size="40 40 40" type="plane"/>
+            <body pos="0 0 1" euler="45 0 0">
+              <freejoint/>
+              <geom type="sdf" mesh="cube"/>
+            </body>
+          </worldbody>
+        </mujoco>
+    """,
+    "sdf_sphere": """
+        <mujoco>
+          <option sdf_iterations="10" sdf_initpoints="40"/>
+          <asset>
+            <mesh name="cube"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+          </asset>
+          <worldbody>
+            <body pos="0 0 0">
+              <geom type="sphere" size="0.5"/>
+            </body>
+            <body pos="0 0 1.3" euler="30 0 0">
+              <freejoint/>
+              <geom type="sdf" mesh="cube"/>
+            </body>
+          </worldbody>
+        </mujoco>
+    """,
+    "sdf_sdf_two_cubes": """
+        <mujoco>
+          <option sdf_iterations="10" sdf_initpoints="40"/>
+          <asset>
+            <mesh name="cube1"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+            <mesh name="cube2"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+          </asset>
+          <worldbody>
+            <body pos="0 0 0">
+              <geom type="sdf" mesh="cube1"/>
+            </body>
+            <body pos="0 0 1.8" euler="45 0 0">
+              <freejoint/>
+              <geom type="sdf" mesh="cube2"/>
+            </body>
+          </worldbody>
+        </mujoco>
+    """,
+    "sdf_sdf_different_meshes": """
+        <mujoco>
+          <option sdf_iterations="10" sdf_initpoints="40"/>
+          <asset>
+            <mesh name="cube"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+            <mesh name="wedge"
+             vertex="0 0 0  1 0 0  0.5 1 0  0 0 1  1 0 1  0.5 1 1"/>
+          </asset>
+          <worldbody>
+            <body pos="0 0 0">
+              <geom type="sdf" mesh="cube"/>
+            </body>
+            <body pos="0.5 0.5 1.8" euler="30 20 0">
+              <freejoint/>
+              <geom type="sdf" mesh="wedge"/>
+            </body>
+          </worldbody>
+        </mujoco>
+    """,
+    "sdf_capsule": """
+        <mujoco>
+          <option sdf_iterations="10" sdf_initpoints="40"/>
+          <asset>
+            <mesh name="cube"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+          </asset>
+          <worldbody>
+            <body pos="0 0 0">
+              <geom type="capsule" size="0.3 0.6"/>
+            </body>
+            <body pos="0 0 1.5" euler="30 0 0">
+              <freejoint/>
+              <geom type="sdf" mesh="cube"/>
+            </body>
+          </worldbody>
+        </mujoco>
+    """,
+    "sdf_cylinder": """
+        <mujoco>
+          <option sdf_iterations="10" sdf_initpoints="40"/>
+          <asset>
+            <mesh name="cube"
+             vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+          </asset>
+          <worldbody>
+            <body pos="0 0 0">
+              <geom type="cylinder" size="0.3 0.6"/>
+            </body>
+            <body pos="0 0 1.5" euler="30 0 0">
+              <freejoint/>
+              <geom type="sdf" mesh="cube"/>
+            </body>
+          </worldbody>
+        </mujoco>
+    """,
+  }
+
+  @parameterized.parameters(_SDF_VOLUME.keys())
+  def test_sdf_volume_collision(self, fixture):
+    """Tests volume SDF collisions (mesh-based octree, no plugin)."""
+    mjm, mjd, m, d = test_data.fixture(xml=self._SDF_VOLUME[fixture])
+
+    mujoco.mj_collision(mjm, mjd)
+    mjw.collision(m, d)
+
+    mj_ncon = mjd.ncon
+    mjw_ncon = d.nacon.numpy()[0]
+
+    # both should detect contacts (or both should not)
+    self.assertEqual(mj_ncon > 0, mjw_ncon > 0, f"MJ ncon={mj_ncon}, MJW ncon={mjw_ncon}")
+
+    # all detected contacts should have negative distance (penetration)
+    for i in range(mjw_ncon):
+      test_dist = d.contact.dist.numpy()[i]
+      self.assertLess(test_dist, 0.1, f"Contact {i} dist={test_dist} not indicating penetration")
+
+  def test_sdf_volume_gradient_physical_coordinates(self):
+    """A linear field's physical gradient is independent of anisotropic cell size."""
+    half_size = np.array([0.002, 0.004, 0.008], dtype=np.float32)
+    corners = np.array([[half_size[k] * (1 if i & (1 << k) else -1) for k in range(3)] for i in range(8)])
+    expected = np.array([1.0, 2.0, 3.0])
+    volume = VolumeData()
+    volume.center = wp.vec3(0.0)
+    volume.half_size = wp.vec3(*half_size)
+    volume.oct_child = wp.array([[-1] * 8], dtype=types.vec8i)
+    volume.oct_aabb = wp.array(np.array([[np.zeros(3), half_size]]), dtype=wp.vec3)
+    volume.oct_coeff = wp.array([corners @ expected], dtype=types.vec8)
+    volume.root = 0
+    volume.valid = True
+    result = wp.zeros(1, dtype=wp.vec3)
+    wp.launch(volume_gradient_test, dim=1, inputs=[volume], outputs=[result])
+    np.testing.assert_allclose(result.numpy()[0], expected, rtol=1e-6, atol=1e-6)
+
+  def test_sdf_gradient_step_preserves_better_iterate(self):
+    """A failed line search keeps the previous point and distance, matching CPU MuJoCo."""
+    signs = np.array([[1 if i & (1 << k) else -1 for k in range(3)] for i in range(8)])
+    centers = np.vstack((np.zeros((1, 3)), signs * 0.0005))
+    half_sizes = np.vstack((np.full((1, 3), 0.001), np.full((8, 3), 0.0005)))
+    corners = centers[:, None, :] + signs * half_sizes[:, None, :]
+    volume = VolumeData()
+    volume.center = wp.vec3(0.0)
+    volume.half_size = wp.vec3(0.001)
+    volume.oct_aabb = wp.array(np.stack((centers, half_sizes), axis=1), dtype=wp.vec3)
+    volume.oct_child = wp.array(np.vstack((np.arange(1, 9), np.full((8, 8), -1))), dtype=types.vec8i)
+    volume.oct_coeff = wp.array(np.abs(corners[:, :, 0]) - 0.0005, dtype=types.vec8)
+    volume.root = 0
+    volume.valid = True
+    result = wp.zeros(1, dtype=wp.vec4)
+    wp.launch(volume_gradient_step_test, dim=1, inputs=[volume], outputs=[result])
+    np.testing.assert_allclose(result.numpy()[0], [1e-6, 1e-4, 1e-4, -0.000499], rtol=1e-5, atol=1e-9)
+
+  @parameterized.parameters(1, 2)
+  def test_sdf_disjoint_bounds_with_candidate_gap(self, nworld):
+    """A candidate gap must not seed SDF minimization inside an empty AABB intersection."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+    <mujoco>
+      <asset>
+        <mesh name="cube" scale=".01 .01 .01"
+          vertex="1 1 1  1 1 -1  1 -1 1  1 -1 -1  -1 1 1  -1 1 -1  -1 -1 1  -1 -1 -1"/>
+      </asset>
+      <worldbody>
+        <geom type="sdf" mesh="cube" gap=".01"/>
+        <body pos="0 0 .022">
+          <freejoint/>
+          <geom type="sdf" mesh="cube" gap=".01"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """,
+      nworld=nworld,
+    )
+    mujoco.mj_collision(mjm, mjd)
+    self.assertEqual(mjd.ncon, 0)
+
+    if nworld == 2:
+      mjd.qpos[2] = 0.015
+      mujoco.mj_kinematics(mjm, mjd)
+      mujoco.mj_collision(mjm, mjd)
+      self.assertGreater(mjd.ncon, 0)
+      qpos = d.qpos.numpy()
+      qpos[1] = mjd.qpos
+      d.qpos.assign(qpos)
+      mjw.kinematics(m, d)
+
+    d.nacon.fill_(-1)
+    mjw.collision(m, d)
+    nacon = d.nacon.numpy()[0]
+    if nworld == 1:
+      self.assertEqual(nacon, 0)
+    else:
+      self.assertGreater(nacon, 0)
+      np.testing.assert_array_equal(d.contact.worldid.numpy()[:nacon], 1)
+      self.assertLess(d.contact.dist.numpy()[:nacon].min(), 0)
+
+  def test_ccd_margin_dist(self):
+    """Tests that CCD contact dist matches MuJoCo when margin > 0.
+
+    Two ellipsoids are placed 0.05 m apart (not touching). With margin=0.01
+    and gap=0.2 on each geom, the pair margin is 0.02 and pair gap is 0.4.
+    CCD inflates geometries by margin, detecting contacts within the
+    speculative envelope. The reported dist must equal the true geometric
+    separation (≈0.05), not the margin-biased value that the inflated
+    GJK/EPA would produce.
+    """
+    xml = f"""
+    <mujoco>
+      <worldbody>
+        <body pos="0 0 0">
+          <freejoint/>
+          <geom type="ellipsoid" size="0.15 0.15 0.25" margin="0.01" gap="0.2"/>
+        </body>
+        <body pos="0 0 0.35">
+          <freejoint/>
+          <geom type="ellipsoid" size="0.1 0.1 0.05" margin="0.01" gap="0.2"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    mjm, mjd, m, d = test_data.fixture(xml=xml)
+
+    mujoco.mj_forward(mjm, mjd)
+    mjw.forward(m, d)
+
+    mj_ncon = mjd.ncon
+    mjw_ncon = d.nacon.numpy()[0]
+
+    self.assertGreater(mj_ncon, 0, "Classic MuJoCo should detect speculative contacts")
+    self.assertGreater(mjw_ncon, 0, "MuJoCo Warp should detect speculative contacts")
+
+    # All classic MuJoCo contacts should have positive dist (separated)
+    for i in range(mj_ncon):
+      self.assertGreater(mjd.contact.dist[i], 0.0)
+
+    # Check that mujoco-warp dist matches classic MuJoCo dist
+    for i in range(mj_ncon):
+      mj_dist = mjd.contact.dist[i]
+      # Find the matching contact in mujoco-warp
+      found = False
+      for j in range(mjw_ncon):
+        mjw_dist = d.contact.dist.numpy()[j]
+        if np.allclose(mj_dist, mjw_dist, atol=1e-2, rtol=5e-2):
+          found = True
+          break
+      self.assertTrue(found, f"MJ contact {i} dist={mj_dist:.4f} not matched in MJW")
+
+    # dist(≈0.05) > margin(0.02): contacts are in gap zone, no constraints
+    self.assertEqual(mjd.nefc, 0, "Classic MuJoCo should have no active constraints")
+    self.assertEqual(d.nefc.numpy()[0], 0, "MuJoCo Warp should have no active constraints")
+
+  def test_adhesion_contacts(self):
+    """Test adhesion contact resolution (priority, pair override, and in-gap dim reduction)."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body>
+            <freejoint/>
+            <geom type="sphere" size="0.1" priority="1" adhesion="5.0"/>
+          </body>
+          <body pos="0 0 0.22">
+            <freejoint/>
+            <geom type="sphere" size="0.1" priority="2" gap="0.05" adhesion="3.0"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+
+    mjw.collision(m, d)
+    mjw.make_constraint(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    np.testing.assert_allclose(d.contact.adhesion.numpy()[0], 3.0)
+    self.assertEqual(d.contact.dim.numpy()[0], 1)
+    self.assertEqual(d.nefc.numpy()[0], 1)
+
+  def test_adhesion_combination_and_pair_override(self):
+    """Test explicit pair adhesion override against geom sum."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <contact>
+          <pair geom1="g1" geom2="g2" adhesion="12.0"/>
+        </contact>
+        <worldbody>
+          <body>
+            <freejoint/>
+            <geom name="g1" type="sphere" size="0.1" adhesion="5.0"/>
+          </body>
+          <body pos="0 0 0.15">
+            <freejoint/>
+            <geom name="g2" type="sphere" size="0.1" adhesion="3.0"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+
+    mjw.collision(m, d)
+
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    np.testing.assert_allclose(d.contact.adhesion.numpy()[0], 12.0)
+
+  def test_adhesion_pulloff_and_tether(self):
+    """Test inside contact (dim=3), in-gap tether (dim=1), and outside gap (nacon=0)."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <geom type="sphere" size="0.1" adhesion="5.0"/>
+          <body pos="0 0 0.15">
+            <freejoint/>
+            <geom type="sphere" size="0.1" gap="0.05" adhesion="3.0"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    # 1. Inside touching contact: pos="0 0 0.15" -> dist=-0.05
+    mjw.collision(m, d)
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    self.assertEqual(d.contact.dim.numpy()[0], 3)
+
+    # 2. In-gap band: pos="0 0 0.22" (dist=0.02, within margin+gap=0.05)
+    qpos = d.qpos.numpy()
+    qpos[0, :3] = np.array([0.0, 0.0, 0.22])
+    d.qpos = wp.from_numpy(qpos, dtype=wp.float32)
+    mjw.kinematics(m, d)
+    mjw.collision(m, d)
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    self.assertEqual(d.contact.dim.numpy()[0], 1)
+
+    # 3. Outside gap band: pos="0 0 0.30" (dist=0.10, > gap=0.05) -> constraint released
+    qpos[0, :3] = np.array([0.0, 0.0, 0.30])
+    d.qpos = wp.from_numpy(qpos, dtype=wp.float32)
+    mjw.kinematics(m, d)
+    mjw.collision(m, d)
+    self.assertEqual(d.nacon.numpy()[0], 0)
+
+  @parameterized.parameters(
+    ("box", "box", 0.18, -0.02),
+    ("box", "box", 0.205, 0.005),
+    ("cylinder", "cylinder", 0.18, -0.02),
+    ("cylinder", "cylinder", 0.205, 0.005),
+    ("capsule", "cylinder", 0.25, -0.05),
+  )
+  def test_convex_contact_frame_parity(self, type1, type2, z2, expected_dist):
+    """Test CCD contact frame normal and dist parity against MuJoCo C."""
+    _, mjd, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <body pos="0 0 0">
+            <geom type="{type1}" size="0.1 0.1 0.1" gap="0.01"/>
+          </body>
+          <body pos="0 0 {z2}">
+            <freejoint/>
+            <geom type="{type2}" size="0.1 0.1 0.1" gap="0.01"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    d.nacon.fill_(-1)
+    d.contact.frame.fill_(wp.inf)
+    d.contact.dist.fill_(wp.inf)
+    mjw.forward(m, d)
+
+    self.assertGreater(mjd.ncon, 0)
+    self.assertGreater(int(d.nacon.numpy()[0]), 0)
+
+    c_norm = mjd.contact.frame[0].reshape((3, 3))[0]
+    w_norm = d.contact.frame.numpy()[0][0]
+    dot = float(np.dot(c_norm, w_norm))
+    self.assertAlmostEqual(dot, 1.0, places=4, msg=f"Frame normal misaligned for {type1}-{type2} at z={z2}")
+    self.assertAlmostEqual(float(d.contact.dist.numpy()[0]), expected_dist, places=4)
+
+  @parameterized.named_parameters(
+    (
+      "cylinder_box_face_to_face",
+      "box",
+      "1 1 1",
+      "",
+      "cylinder",
+      "0.5 1",
+      1.99,
+      "",
+      4,
+      None,
+    ),
+    (
+      "cylinder_box_horizontal_issue_1555",
+      "box",
+      "1 1 1",
+      "",
+      "cylinder",
+      "0.5 1",
+      1.49,
+      ' euler="90 0 0"',
+      2,
+      (-1.0, 1.0),
+    ),
+    (
+      "cylinder_cylinder_face_to_face",
+      "cylinder",
+      "1 1",
+      "",
+      "cylinder",
+      "1 1",
+      1.99,
+      "",
+      4,
+      None,
+    ),
+    (
+      "cylinder_cylinder_side_to_side",
+      "cylinder",
+      "1 1",
+      ' euler="90 0 0"',
+      "cylinder",
+      "1 1",
+      1.99,
+      ' euler="90 0 0"',
+      1,
+      None,
+    ),
+  )
+  def test_cylinder_multiccd(
+    self,
+    geom1_type: str,
+    geom1_size: str,
+    geom1_euler: str,
+    geom2_type: str,
+    geom2_size: str,
+    z2: float,
+    geom2_euler: str,
+    expected_ncon: int,
+    expected_y_coords: tuple[float, float] | None,
+  ):
+    """Test cylinder MultiCCD contacts and fallback with MultiCCD disabled."""
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <geom type="{geom1_type}" size="{geom1_size}" pos="0 0 0"{geom1_euler}/>
+          <body pos="0 0 {z2}">
+            <freejoint/>
+            <geom type="{geom2_type}" size="{geom2_size}"{geom2_euler}/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    d.nacon.fill_(-1)
+    d.contact.dist.fill_(wp.inf)
+    d.contact.pos.fill_(wp.inf)
+    d.contact.frame.fill_(wp.inf)
+    mjw.collision(m, d)
+    self.assertEqual(int(d.nacon.numpy()[0]), expected_ncon)
+    self.assertTrue(np.all(np.isfinite(d.contact.dist.numpy()[:expected_ncon])))
+
+    if expected_y_coords is not None:
+      pos = d.contact.pos.numpy()[:expected_ncon]
+      # Check that contact points are at the two ends of the horizontal cylinder axis
+      y_coords = sorted([float(p[1]) for p in pos])
+      self.assertAlmostEqual(y_coords[0], expected_y_coords[0], delta=0.05)
+      self.assertAlmostEqual(y_coords[1], expected_y_coords[1], delta=0.05)
+
+    # with MultiCCD disabled, should find 1 contact
+    m.opt.disableflags |= int(types.DisableBit.MULTICCD)
+    d.nacon.fill_(-1)
+    d.contact.dist.fill_(wp.inf)
+    d.contact.pos.fill_(wp.inf)
+    d.contact.frame.fill_(wp.inf)
+    mjw.collision(m, d)
+    self.assertEqual(int(d.nacon.numpy()[0]), 1)
+    self.assertTrue(np.isfinite(float(d.contact.dist.numpy()[0])))
+
+
+if __name__ == "__main__":
+  absltest.main()

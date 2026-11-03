@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mps-supermimic"
+version = "0.1.0"
+description = "Apple Silicon MLX/Metal SuperMimic training with a modified MuJoCo-Warp MPS backend"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mlx==0.32.3",
+  "mujoco==3.13.1.dev984848064",
+  "mujoco-warp-lucidrains-fork[mlx]==0.0.6",
+  "numpy==2.3.4",
+  "warp-lang==1.15.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==9.0.3",
+  "pytest-xdist==3.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["supermimic*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["third_party"]
+
+[[tool.uv.index]]
+name = "mujoco"
+url = "https://py.mujoco.org/"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.uv.sources]
+mujoco = { index = "mujoco" }
+mujoco-warp-lucidrains-fork = { path = "third_party/mujoco_warp", editable = true }
+warp-lang = { index = "nvidia" }
+
+[tool.uv]
+package = true

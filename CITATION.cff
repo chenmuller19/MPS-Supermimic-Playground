@@ -1,0 +1,6 @@
+cff-version: 1.2.0
+message: "Cite the upstream frameworks and model assets listed in THIRD_PARTY_NOTICES.md when using this project."
+title: "MPS-Supermimic"
+type: software
+authors:
+  - name: "MPS-Supermimic contributors"

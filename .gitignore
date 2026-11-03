@@ -1,0 +1,23 @@
+# Python and uv
+.venv/
+.uv/
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Motion data is downloaded from Hugging Face under CC BY-NC-ND 4.0.
+data/origin_lafan1_g1/*.csv
+
+# Generated training artifacts
+logs/**
+checkpoints/**
+runs/**
+results/**
+*.npz
+*.ckpt
