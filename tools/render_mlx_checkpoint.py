@@ -111,6 +111,18 @@ def _clip_index(motion: MotionLib, selector: str) -> int:
     raise ValueError(f"unknown clip {selector!r}; available clips: {', '.join(motion.names)}")
 
 
+def _apply_runtime_paths(config: dict, motion_dir: Path | None, xml: Path | None) -> dict:
+    config = dict(config)
+    if motion_dir is not None:
+        config["motion_dir"] = str(motion_dir.expanduser().resolve())
+    if xml is not None:
+        xml_path = xml.expanduser().resolve()
+        config["xml"] = str(xml_path)
+        if config.get("physics") is not None:
+            config["physics"] = {**config["physics"], "xml": str(xml_path)}
+    return config
+
+
 def _reset_reference(env: MPSVectorEnv, motion: MotionLib, frame: int) -> None:
     ids = np.array([0], dtype=np.int32)
     env.friction_np[0] = 0.75
@@ -286,7 +298,9 @@ def _view(config, policy, clip_selector: str, show_ghost: bool = True) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", nargs="?", type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--clip", default="0", help="clip index or exact motion name")
+    parser.add_argument("--clip", default="0", help="clip index or exact motion name without .csv")
+    parser.add_argument("--motion-dir", type=Path, default=None, help="override the motion directory in checkpoint metadata")
+    parser.add_argument("--xml", type=Path, default=None, help="override the physics XML path in checkpoint metadata")
     parser.add_argument("--no-ghost", action="store_true", help="hide the translucent reference robot")
     parser.add_argument("--check-only", action="store_true", help="load weights and validate one policy output")
     args = parser.parse_args()
@@ -295,6 +309,7 @@ def main() -> None:
         raise RuntimeError("MLX Metal is unavailable; use the Warp-MPS training environment")
     mx.set_default_device(mx.gpu)
     checkpoint_path, metadata, config, wm, policy, critic = _load_models(args.checkpoint)
+    config = _apply_runtime_paths(config, args.motion_dir, args.xml)
     iteration = int(metadata.get("iteration", -1))
     print(
         f"Loaded {checkpoint_path} | iteration {iteration} | "
